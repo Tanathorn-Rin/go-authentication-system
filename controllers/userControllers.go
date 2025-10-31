@@ -14,10 +14,16 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
+// validate is the validator instance used for struct validation
 var validate = validator.New()
 
+// userCollection is the MongoDB collection for user documents
 var userCollection = config.OpenCollection("users")
 
+// Signup handles user registration
+// It validates input, checks for duplicate email/phone, hashes password,
+// generates JWT tokens, and creates a new user in the database
+// Returns: gin.HandlerFunc that processes the signup request
 func Signup() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -25,18 +31,19 @@ func Signup() gin.HandlerFunc {
 
 		var user models.User
 
-		//Get user input
+		// Bind JSON request body to user struct
 		if err := c.BindJSON(&user); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 
-		//Validate user input
+		// Validate user input against struct validation tags
 		if validationErr := validate.Struct(user); validationErr != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": validationErr.Error()})
 			return
 		}
 
+		// Check if email or phone already exists in database
 		count, err := userCollection.CountDocuments(ctx, bson.M{
 			"$or": []bson.M{
 				{"email": user.Email},
@@ -49,12 +56,13 @@ func Signup() gin.HandlerFunc {
 			return
 		}
 
+		// Prevent duplicate registrations
 		if count > 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Email or phone already exists"})
 			return
 		}
 
-		//Generate rest of the user data
+		// Generate additional user data (hash password, create ID, generate tokens)
 		hashedPassword := helpers.HashPassword(*user.Password)
 		user.Password = &hashedPassword
 		user.Created_at = time.Now()
@@ -75,6 +83,10 @@ func Signup() gin.HandlerFunc {
 	}
 }
 
+// Login handles user authentication
+// It verifies email and password, generates new JWT tokens,
+// updates tokens in database, and returns user data with tokens
+// Returns: gin.HandlerFunc that processes the login request
 func Login() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -83,12 +95,13 @@ func Login() gin.HandlerFunc {
 		var user models.User
 		var foundUser models.User
 
-		// Get user input
+		// Bind JSON request body to user struct
 		if err := c.BindJSON(&user); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 
+		// Find user by email in database
 		err := userCollection.FindOne(ctx, bson.M{"email": user.Email}).Decode(&foundUser)
 
 		if err != nil {
@@ -96,16 +109,19 @@ func Login() gin.HandlerFunc {
 			return
 		}
 
-		//verify password
+		// Verify the provided password matches the stored hashed password
 		passwordIsValid, msg := helpers.VerifyPassword(*foundUser.Password, *user.Password)
 		if !passwordIsValid {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": msg})
 			return
 		}
 
-		token, refreshToken := helpers.GenerateTokens(*foundUser.Email, *&foundUser.User_id, *foundUser.Role)
+		// Generate new access and refresh tokens for the user
+		token, refreshToken := helpers.GenerateTokens(*foundUser.Email, foundUser.User_id, *foundUser.Role)
+		// Update the tokens in the database
 		helpers.UpdateAllTokens(token, refreshToken, foundUser.User_id)
 
+		// Return user data along with tokens
 		c.JSON(http.StatusOK, gin.H{
 			"user":          foundUser,
 			"token":         token,
@@ -114,18 +130,22 @@ func Login() gin.HandlerFunc {
 	}
 }
 
+// GetUser retrieves a specific user by ID
+// Regular users can only access their own profile, ADMIN can access any profile
+// Requires JWT authentication
+// Returns: gin.HandlerFunc that processes the get user request
 func GetUser() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		requestedUserId := c.Param("id")
 
-		// Get claims from the context
+		// Get JWT claims from context (set by auth middleware)
 		claims, exists := c.Get("claims")
 		if !exists {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
 		}
 
-		// Type assertion to get the claims object
+		// Type assertion to extract claims data
 		tokenClaims, ok := claims.(*helpers.Claims)
 		if !ok {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid claims"})
@@ -135,6 +155,7 @@ func GetUser() gin.HandlerFunc {
 		tokenUserId := tokenClaims.UserID
 		userType := tokenClaims.Role
 
+		// Authorization check: Users can only view their own profile, ADMIN can view all
 		if userType != "ADMIN" && tokenUserId != requestedUserId {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
@@ -143,6 +164,7 @@ func GetUser() gin.HandlerFunc {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
+		// Find user in database by user_id
 		var user models.User
 		err := userCollection.FindOne(ctx, bson.M{"user_id": requestedUserId}).Decode(&user)
 		if err != nil {
@@ -150,33 +172,38 @@ func GetUser() gin.HandlerFunc {
 			return
 		}
 
+		// Return user data
 		c.JSON(http.StatusOK, user)
 	}
 }
 
+// GetUsers retrieves all users from the database
+// This endpoint is restricted to ADMIN users only
+// Requires JWT authentication
+// Returns: gin.HandlerFunc that processes the get all users request
 func GetUsers() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Retrieve claims from context
+		// Retrieve JWT claims from context
 		claims, exists := c.Get("claims")
 		if !exists {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
 		}
 
-		// Type assertion to get the claims object
+		// Type assertion to extract claims data
 		tokenClaims, ok := claims.(*helpers.Claims)
 		if !ok {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid claims"})
 			return
 		}
 
-		// Check if the user is an ADMIN
+		// Authorization check: Only ADMIN users can view all users
 		if tokenClaims.Role != "ADMIN" {
 			c.JSON(http.StatusUnauthorized, gin.H{"message": "Unauthorized"})
 			return
 		}
 
-		// Proceed to get the users list from the database
+		// Retrieve all users from the database
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
